@@ -19,7 +19,13 @@ def _py_binary_rule_impl(ctx):
 
     # Check for duplicate virtual dependency names. Those that map to the same resolution target would have been merged by the depset for us.
     virtual_resolution = _py_library.resolve_virtuals(ctx)
-    imports_depset = _py_library.make_imports_depset(ctx, extra_imports_depsets = virtual_resolution.imports)
+
+    # extra_libs are for runfiles and LD_LIBRARY_PATH, not for PYTHONPATH.
+    # So, we don't add their PyInfo.imports to the .pth file here.
+    imports_depset = _py_library.make_imports_depset(
+        ctx,
+        extra_imports_depsets = virtual_resolution.imports, # Only includes imports from deps and virtual_resolution
+    )
 
     pth_lines = ctx.actions.args()
     pth_lines.use_param_file("%s", use_always = True)
@@ -70,6 +76,85 @@ def _py_binary_rule_impl(ctx):
     if hasattr(ctx.attr, "custom_run_script_hook_content") and ctx.attr.custom_run_script_hook_content:
         custom_script_hook_content_from_attr = ctx.attr.custom_run_script_hook_content
 
+    # --- Auto LD_LIBRARY_PATH setup for extra_libs --- START ---
+    auto_ld_library_path_setup_cmds = []
+    if hasattr(ctx.attr, "extra_libs") and ctx.attr.extra_libs:
+        auto_ld_library_path_setup_cmds.append("echo \"INFO: Processing extra_libs for LD_LIBRARY_PATH...\"")
+        auto_ld_library_path_setup_cmds.append("TEMP_LD_PATHS_COLLECTED=()"); # Use a bash array
+
+        for i, lib_target in enumerate(ctx.attr.extra_libs):
+            # Use the short_path of the label as the argument to rlocation
+            # This is generally what rlocation expects for targets.
+            rloc_arg = lib_target.label.name # Using name to get a more unique identifier for var names
+            if ctx.label.workspace_root: # Non-empty for external repos usually
+                 # For targets in external repos, short_path is often more direct for rlocation
+                 # For targets in the main repo, label.name might be like //pkg:name
+                 # We rely on rlocation being smart enough; short_path is usually safest for files.
+                 # However, rlocation might need workspace_name/path for files from external repos.
+                 # Let's assume short_path of the File object is the most reliable.
+                 # Since lib_target is a Target, not a File, we use its label. This is a common convention.
+                 # The actual `rlocation` argument needs to map to what's in the MANIFEST.
+                 # For a target @foo//bar:baz, rlocation often takes "foo/bar/baz" or similar.
+                 # We will pass the direct label string to rlocation, e.g. "@repo//pkg:name"
+                 # or "//pkg:name". The BASH_RLOCATION_FN sourced should handle this.
+                pass # rloc_arg is already set to label.name
+
+            # A unique variable name for the resolved path of each lib
+            # Sanitize label name for shell variable
+            sanitized_label_name = "EXTRA_LIB_" + str(lib_target.label).replace("/", "_").replace(":", "_").replace("@", "").replace("~", "_").replace("-", "_").upper()
+
+            # Using .format() for idx and rloc_arg makes it clearer.
+            # Each command is a separate string for clarity and correctness.
+            auto_ld_library_path_setup_cmds.append(
+                "CANDIDATE_PATH_{idx}=\"$(rlocation \\\"{rloc_arg}\\\")\"".format(
+                    idx = sanitized_label_name,
+                    rloc_arg = str(lib_target.label)
+                )
+            )
+            auto_ld_library_path_setup_cmds.append("LIB_DIR_TO_ADD_{idx}=\"\";".format(idx = sanitized_label_name))
+            auto_ld_library_path_setup_cmds.append("if [ -n \"${{CANDIDATE_PATH_{idx}:-}}\" ]; then".format(idx = sanitized_label_name))
+            auto_ld_library_path_setup_cmds.append("  if [ -d \"${{CANDIDATE_PATH_{idx}}}\" ]; then".format(idx = sanitized_label_name))
+            auto_ld_library_path_setup_cmds.append("    LIB_DIR_TO_ADD_{idx}=\"${{CANDIDATE_PATH_{idx}}}\";".format(idx = sanitized_label_name))
+            auto_ld_library_path_setup_cmds.append("  elif [ -f \"${{CANDIDATE_PATH_{idx}}}\" ]; then".format(idx = sanitized_label_name))
+            auto_ld_library_path_setup_cmds.append(
+                "    LIB_DIR_TO_ADD_{idx}=\"$(dirname \\\"${{CANDIDATE_PATH_{idx}}}\\\")\"".format(idx = sanitized_label_name)
+            )
+            auto_ld_library_path_setup_cmds.append("  fi;".format(idx = sanitized_label_name))
+            auto_ld_library_path_setup_cmds.append("fi;".format(idx = sanitized_label_name))
+            auto_ld_library_path_setup_cmds.append("if [ -n \"${{LIB_DIR_TO_ADD_{idx}:-}}\" ]; then".format(idx = sanitized_label_name))
+            auto_ld_library_path_setup_cmds.append("  SHOULD_ADD=true") # No .format here, direct shell command
+            auto_ld_library_path_setup_cmds.append("  for existing_path in \"${TEMP_LD_PATHS_COLLECTED[@]}\"; do")
+            auto_ld_library_path_setup_cmds.append(
+                "    if [[ \"${{existing_path}}\" == \"${{LIB_DIR_TO_ADD_{idx}}}\" ]]; then".format(idx = sanitized_label_name)
+            )
+            auto_ld_library_path_setup_cmds.append("      SHOULD_ADD=false; break;")
+            auto_ld_library_path_setup_cmds.append("    fi")
+            auto_ld_library_path_setup_cmds.append("  done")
+            auto_ld_library_path_setup_cmds.append("  if $SHOULD_ADD; then TEMP_LD_PATHS_COLLECTED+=(\"${{LIB_DIR_TO_ADD_{idx}}}\"); fi".format(idx = sanitized_label_name))
+            auto_ld_library_path_setup_cmds.append("fi;")
+
+        auto_ld_library_path_setup_cmds.extend([
+            "FINAL_AUTO_LD_LIBRARY_PATH=\"\"",
+            "for path_component in \"${TEMP_LD_PATHS_COLLECTED[@]}\"; do",
+            "  if [ -z \"${FINAL_AUTO_LD_LIBRARY_PATH}\" ]; then",
+            "    FINAL_AUTO_LD_LIBRARY_PATH=\"${path_component}\";",
+            "  else",
+            "    FINAL_AUTO_LD_LIBRARY_PATH=\"${path_component}:${FINAL_AUTO_LD_LIBRARY_PATH}\";", # Prepend to ensure priority
+            "  fi;",
+            "done;",
+            "if [ -n \"${FINAL_AUTO_LD_LIBRARY_PATH}\" ]; then",
+            "  if [ -n \"${LD_LIBRARY_PATH:-}\" ]; then", # Check if LD_LIBRARY_PATH is already set and not empty
+            "    export LD_LIBRARY_PATH=\"${FINAL_AUTO_LD_LIBRARY_PATH}:${LD_LIBRARY_PATH}\";",
+            "  else",
+            "    export LD_LIBRARY_PATH=\"${FINAL_AUTO_LD_LIBRARY_PATH}\";",
+            "  fi;",
+            "  echo \"INFO: Automatically prepended to LD_LIBRARY_PATH from extra_libs: ${FINAL_AUTO_LD_LIBRARY_PATH}\"", # Log the components added
+            "  echo \"INFO: Full LD_LIBRARY_PATH: ${LD_LIBRARY_PATH}\"",
+            "fi;",
+            "unset TEMP_LD_PATHS_COLLECTED FINAL_AUTO_LD_LIBRARY_PATH;", # Clean up temp variables
+        ])
+    # --- Auto LD_LIBRARY_PATH setup for extra_libs --- END ---
+
     executable_launcher = ctx.actions.declare_file(ctx.attr.name)
     ctx.actions.expand_template(
         template = ctx.file._run_tmpl,
@@ -84,11 +169,12 @@ def _py_binary_rule_impl(ctx):
             "{{ARG_PTH_FILE}}": to_rlocation_path(ctx, site_packages_pth_file),
             "{{ENTRYPOINT}}": to_rlocation_path(ctx, ctx.file.main),
             "{{PYTHON_ENV}}": "\n".join(_dict_to_exports(default_env)).strip(),
+            "{{AUTO_LD_LIBRARY_PATH_SETUP}}": "\n".join(auto_ld_library_path_setup_cmds).strip(),
+            "{{CUSTOM_SCRIPT_HOOK_PRE_EXEC}}": custom_script_hook_content_from_attr,
             "{{EXEC_PYTHON_BIN}}": "python{}".format(
                 py_toolchain.interpreter_version_info.major,
             ),
             "{{RUNFILES_INTERPRETER}}": str(py_toolchain.runfiles_interpreter).lower(),
-            "{{CUSTOM_SCRIPT_HOOK_PRE_EXEC}}": custom_script_hook_content_from_attr, # This will be the string content or an empty string
         },
         is_executable = True,
     )
@@ -96,7 +182,16 @@ def _py_binary_rule_impl(ctx):
     srcs_depset = _py_library.make_srcs_depset(ctx)
 
     # No need to add the hook script to runfiles as its content is passed as a string attribute.
-    runfiles_extra_runfiles_list = [site_packages_pth_file]
+    # Based on user's last diff, extra_runfiles will just be site_packages_pth_file.
+    # If runfiles_extra_runfiles_list was defined before, it's simplified now.
+    current_extra_runfiles_list = [site_packages_pth_file]
+
+    # Collect DefaultInfo.default_runfiles from extra_libs
+    extra_runfiles_depsets_from_extra_libs = []
+    if hasattr(ctx.attr, "extra_libs"):
+        for lib in ctx.attr.extra_libs:
+            if DefaultInfo in lib:
+                extra_runfiles_depsets_from_extra_libs.append(lib[DefaultInfo].default_runfiles)
 
     runfiles = _py_library.make_merged_runfiles(
         ctx,
@@ -104,13 +199,11 @@ def _py_binary_rule_impl(ctx):
             py_toolchain.files,
             srcs_depset,
         ] + virtual_resolution.srcs + virtual_resolution.runfiles,
-        extra_runfiles = [
-            site_packages_pth_file,
-        ],
+        extra_runfiles = current_extra_runfiles_list, # Should be [site_packages_pth_file]
         extra_runfiles_depsets = [
             ctx.attr._runfiles_lib[DefaultInfo].default_runfiles,
             venv_toolchain.default_info.default_runfiles,
-        ],
+        ] + extra_runfiles_depsets_from_extra_libs,
     )
 
     instrumented_files_info = _py_library.make_instrumented_files_info(
@@ -189,6 +282,11 @@ A collision can occur when multiple packages providing the same file are install
     "custom_run_script_hook_content": attr.string(
         doc = "Shell script content to be injected into the run script before execution.",
         default = "",
+    ),
+    # Renamed from _implicit_sibling_data_targets and repurposed
+    "extra_libs": attr.label_list(
+        doc = "Additional library targets whose runfiles and Python imports should be available to this target, without being direct dependencies.",
+        allow_empty = True,
     ),
 })
 

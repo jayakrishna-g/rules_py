@@ -51,6 +51,8 @@ export PATH
 # Set all the env vars here, just before we launch
 {{PYTHON_ENV}}
 
+{{AUTO_LD_LIBRARY_PATH_SETUP}}
+
 # This should detect bash and zsh, which have a hash command that must
 # be called to get it to forget past commands.  Without forgetting
 # past commands the $PATH changes we made may not be respected
