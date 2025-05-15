@@ -65,6 +65,11 @@ def _py_binary_rule_impl(ctx):
             attribute_name = "env",
         )
 
+    # Get the custom script content directly from the attribute if provided
+    custom_script_hook_content_from_attr = ""
+    if hasattr(ctx.attr, "custom_run_script_hook_content") and ctx.attr.custom_run_script_hook_content:
+        custom_script_hook_content_from_attr = ctx.attr.custom_run_script_hook_content
+
     executable_launcher = ctx.actions.declare_file(ctx.attr.name)
     ctx.actions.expand_template(
         template = ctx.file._run_tmpl,
@@ -83,11 +88,15 @@ def _py_binary_rule_impl(ctx):
                 py_toolchain.interpreter_version_info.major,
             ),
             "{{RUNFILES_INTERPRETER}}": str(py_toolchain.runfiles_interpreter).lower(),
+            "{{CUSTOM_SCRIPT_HOOK_PRE_EXEC}}": custom_script_hook_content_from_attr, # This will be the string content or an empty string
         },
         is_executable = True,
     )
 
     srcs_depset = _py_library.make_srcs_depset(ctx)
+
+    # No need to add the hook script to runfiles as its content is passed as a string attribute.
+    runfiles_extra_runfiles_list = [site_packages_pth_file]
 
     runfiles = _py_library.make_merged_runfiles(
         ctx,
@@ -175,6 +184,11 @@ A collision can occur when multiple packages providing the same file are install
     # Required for py_version attribute
     "_allowlist_function_transition": attr.label(
         default = "@bazel_tools//tools/allowlists/function_transition_allowlist",
+    ),
+    # Changed from a file label to a string attribute
+    "custom_run_script_hook_content": attr.string(
+        doc = "Shell script content to be injected into the run script before execution.",
+        default = "",
     ),
 })
 
