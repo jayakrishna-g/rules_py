@@ -148,14 +148,22 @@ def py_test(name, srcs = [], main = None, pytest_main = False, **kwargs):
     if resolutions:
         resolutions = resolutions.to_label_keyed_dict()
 
-    deps = kwargs.pop("deps", [])
+    # If deps is a select, convert it to a list by adding it to an empty list.
+    # Otherwise, it remains a list.
+    deps_list = kwargs.pop("deps", [])
+    if type(deps_list) != "list":
+        deps_list = [] + deps_list
+
     if pytest_main:
         if main:
             fail("When pytest_main is set, the main attribute should not be set.")
         pytest_main_target = name + ".pytest_main"
         main = pytest_main_target + ".py"
         py_pytest_main(name = pytest_main_target)
+        # Ensure srcs is a list before appending
+        if type(srcs) != "list":
+            srcs = [] + srcs
         srcs.append(main)
-        deps.append(pytest_main_target)
+        deps_list.append(pytest_main_target)
 
-    _py_binary_or_test(name = name, rule = _py_test, srcs = srcs, deps = deps, main = main, resolutions = resolutions, **kwargs)
+    _py_binary_or_test(name = name, rule = _py_test, srcs = srcs, deps = deps_list, main = main, resolutions = resolutions, **kwargs)
