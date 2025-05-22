@@ -3,6 +3,7 @@
 load("@aspect_bazel_lib//lib:expand_make_vars.bzl", "expand_locations", "expand_variables")
 load("@aspect_bazel_lib//lib:paths.bzl", "BASH_RLOCATION_FUNCTION", "to_rlocation_path")
 load("@rules_python//python:defs.bzl", "PyInfo")
+load("@bazel_skylib//lib:new_sets.bzl", "sets")
 load("//py/private:py_library.bzl", _py_library = "py_library_utils")
 load("//py/private:py_semantics.bzl", _py_semantics = "semantics")
 load("//py/private/toolchain:types.bzl", "PY_TOOLCHAIN", "VENV_TOOLCHAIN")
@@ -64,6 +65,40 @@ def _py_binary_rule_impl(ctx):
             expand_locations(ctx, v, ctx.attr.data),
             attribute_name = "env",
         )
+    
+    # For py_test, add test file information to environment
+    # Check if we're in a test context by looking for _lcov_merger which is only present in test rules
+    is_test = hasattr(ctx.attr, "_lcov_merger")
+    if is_test:
+        test_files = []
+        
+        # For each source file, calculate its path that will work in the runfiles context
+        for src in ctx.files.srcs:
+            # Skip the pytest main file if it's in srcs
+            if src.short_path.endswith(".pytest_main.py"):
+                continue
+                
+            # Use the short path which will be relative to the workspace
+            # The short_path is more reliable for pytest than rlocation paths
+            test_path = src.short_path
+            
+            # Add the file if we have a valid path
+            if test_path:
+                test_files.append(test_path)
+        
+        # Join with colon separator for environment variable
+        if test_files:
+            passed_env["PY_TEST_FILES"] = ":".join(test_files)
+            
+        # Also pass a list of test directories to help with discovery
+        _test_dirs_set = sets.make()
+        for test_path in test_files:
+            # Extract directory part of the path
+            dir_path = test_path.rsplit("/", 1)[0] if "/" in test_path else "."
+            sets.insert(_test_dirs_set, dir_path)
+            
+        if sets.length(_test_dirs_set) > 0:
+            passed_env["PY_TEST_DIRS"] = ":".join(sorted(sets.to_list(_test_dirs_set)))
 
     # Get the custom script content directly from the attribute if provided
     custom_script_hook_content_from_attr = ""
