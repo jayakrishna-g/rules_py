@@ -155,7 +155,7 @@ def py_test(name, srcs = [], main = None, pytest_main = False, **kwargs):
         pytest_main_target = name + ".pytest_main"
         main = pytest_main_target + ".py"
         py_pytest_main(name = pytest_main_target)
-        srcs.append(main)
-        deps.append(pytest_main_target)
+        srcs += [main]
+        deps += [pytest_main_target]
 
     _py_binary_or_test(name = name, rule = _py_test, srcs = srcs, deps = deps, main = main, resolutions = resolutions, **kwargs)
